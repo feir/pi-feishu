@@ -132,6 +132,8 @@ interface ChatState {
     toolCallId: string;
     argSummary?: string;
     errorSnippet?: string;
+    args?: unknown;
+    result?: unknown;
   }>;
 }
 
@@ -489,7 +491,13 @@ export default function (pi: ExtensionAPI) {
     const toolName = event.toolName as string;
     const toolCallId = event.toolCallId as string;
     const argSummary = summarizeArgs(toolName, event.args);
-    state.toolEntries.push({ name: toolName, status: "running", toolCallId, argSummary });
+    state.toolEntries.push({
+      name: toolName,
+      status: "running",
+      toolCallId,
+      argSummary,
+      args: event.args,
+    });
 
     updateProgressCard(state);
     flashStatus(`飞书: 🔧 ${toolDisplayName(toolName)}...`);
@@ -509,6 +517,7 @@ export default function (pi: ExtensionAPI) {
     if (!entry) return;
 
     entry.status = isError ? "error" : "done";
+    entry.result = event.result;
     if (isError) {
       entry.errorSnippet = errorSnippet(event.result);
     }
@@ -551,10 +560,18 @@ export default function (pi: ExtensionAPI) {
         client.sendMessage(state.chatId, chunk, state.userMsgId);
       }
     } else {
-      // 最终轮（或无工具调用的单轮）→ 发送文本（新消息）
-      const chunks = chunkText(processed, MAX_TEXT_CHUNK);
-      for (const chunk of chunks) {
-        client.sendMessage(state.chatId, chunk);
+      // 最终轮（或无工具调用的单轮）
+      if (state.progressMsgId) {
+        // 有进度卡 → patch 卡片合并最终回复
+        const panels = buildEntryPanels(state.toolEntries);
+        const card = FeishuClient.buildCompletedCard(panels, processed, "完成");
+        client.updateCard(state.progressMsgId, card).catch(() => {});
+      } else {
+        // 无进度卡 → 发送文本（新消息）
+        const chunks = chunkText(processed, MAX_TEXT_CHUNK);
+        for (const chunk of chunks) {
+          client.sendMessage(state.chatId, chunk);
+        }
       }
     }
 
@@ -612,52 +629,122 @@ export default function (pi: ExtensionAPI) {
   //  进度卡片
   // ═══════════════════════════════════════════════════════
 
+  /** 格式化值用于卡片 code block 显示（保留换行，截断过大的内容） */
+  function formatForCodeBlock(value: unknown, maxLen = 3000): string {
+    if (value === undefined || value === null) return "";
+    let text: string;
+    if (typeof value === "string") {
+      text = value;
+    } else {
+      try { text = JSON.stringify(value, null, 2); } catch { text = String(value); }
+    }
+    if (text.length > maxLen) {
+      text = text.slice(0, maxLen) + "\n... (截断)";
+    }
+    return text.replace(/```/g, "\\`\\`\\`");
+  }
+
+  /** 构建单个工具的 collapsible_panel 元素 */
+  function buildEntryPanel(
+    entry: ChatState["toolEntries"][number],
+  ): Record<string, unknown> {
+    const displayName = toolDisplayName(entry.name);
+    const detail = entry.argSummary ? ` · ${entry.argSummary}` : "";
+
+    let titleContent: string;
+    switch (entry.status) {
+      case "running":
+        titleContent = `⏳ **${displayName}**${detail}`;
+        break;
+      case "done":
+        titleContent = `✅ ~~${displayName}~~${detail}`;
+        break;
+      case "error":
+        titleContent = `❌ **${displayName}**${detail}`;
+        if (entry.errorSnippet) {
+          titleContent += `\n   ↳ ${entry.errorSnippet}`;
+        }
+        break;
+    }
+
+    const bodyElements: Record<string, unknown>[] = [];
+
+    // 完整参数
+    if (entry.args !== undefined) {
+      const argsText = formatForCodeBlock(entry.args);
+      bodyElements.push({
+        tag: "markdown",
+        content: `**输入参数**\n\`\`\`json\n${argsText}\n\`\`\``,
+      });
+    }
+
+    // 完整结果 / 运行中占位
+    if (entry.status === "running") {
+      bodyElements.push({ tag: "markdown", content: "⏳ 执行中..." });
+    } else if (entry.result !== undefined) {
+      const resultText = formatForCodeBlock(entry.result);
+      bodyElements.push({
+        tag: "markdown",
+        content: `**输出结果**\n\`\`\`\n${resultText}\n\`\`\``,
+      });
+    }
+
+    return {
+      tag: "collapsible_panel",
+      expanded: false,
+      header: {
+        title: { tag: "markdown", content: titleContent },
+        icon: {
+          tag: "standard_icon",
+          token: "down-small-ccm_outlined",
+          size: "16px 16px",
+        },
+        icon_position: "right",
+        icon_expanded_angle: -180,
+      },
+      border: { color: "grey", corner_radius: "5px" },
+      vertical_spacing: "8px",
+      padding: "8px 8px 8px 8px",
+      elements: bodyElements,
+    };
+  }
+
   /**
-   * 构建工具进度卡片内容。
-   * 所有工具共用一条可编辑消息，只滚动保留最近 10 次操作。
+   * 构建工具进度卡片元素数组。
+   * 每个工具调用一个 collapsible_panel，标题保留当前摘要，展开区显示完整 args/result。
+   * 只保留最近 10 次操作。
    */
-  function buildProgressCardContent(entries: ChatState["toolEntries"]): string {
+  function buildEntryPanels(
+    entries: ChatState["toolEntries"],
+  ): Record<string, unknown>[] {
     const MAX_DISPLAY = 10;
     const total = entries.length;
     const display = total > MAX_DISPLAY ? entries.slice(-MAX_DISPLAY) : entries;
 
-    const lines: string[] = [];
+    const panels: Record<string, unknown>[] = [];
 
-    // 如果有截断，显示省略提示
     if (total > MAX_DISPLAY) {
-      lines.push(`... 前 ${total - MAX_DISPLAY} 次操作已折叠\n`);
+      panels.push({
+        tag: "markdown",
+        content: `... 前 ${total - MAX_DISPLAY} 次操作已折叠`,
+      });
     }
 
     for (const entry of display) {
-      const displayName = toolDisplayName(entry.name);
-      const detail = entry.argSummary ? ` · ${entry.argSummary}` : "";
-      switch (entry.status) {
-        case "running":
-          lines.push(`⏳ **${displayName}**${detail}`);
-          break;
-        case "done":
-          lines.push(`✅ ~~${displayName}~~${detail}`);
-          break;
-        case "error":
-          lines.push(`❌ **${displayName}**${detail}`);
-          if (entry.errorSnippet) {
-            lines.push(`   ↳ ${entry.errorSnippet}`);
-          }
-          break;
-      }
+      panels.push(buildEntryPanel(entry));
     }
-    return lines.join("\n");
+    return panels;
   }
 
   /** 创建或更新进度卡片（防竞态：全生命周期只创建一条消息） */
   function updateProgressCard(state: ChatState): void {
     if (!client) return;
 
-    const content = buildProgressCardContent(state.toolEntries);
+    const panels = buildEntryPanels(state.toolEntries);
     const runningCount = state.toolEntries.filter((e) => e.status === "running").length;
     const status = runningCount > 0 ? `执行中 (${runningCount})` : "工具调用";
 
-    const card = FeishuClient.buildStreamingCard(content, status);
+    const card = FeishuClient.buildProgressCard(panels, status);
 
     // 情况 1: 卡片已创建 → 直接更新
     if (state.progressMsgId) {
@@ -680,10 +767,10 @@ export default function (pi: ExtensionAPI) {
       if (cardMsgId) {
         state.progressMsgId = cardMsgId;
         // 创建后立即用最新状态刷新（可能有新事件在创建期间发生）
-        const latestContent = buildProgressCardContent(state.toolEntries);
+        const latestPanels = buildEntryPanels(state.toolEntries);
         const latestRunning = state.toolEntries.filter((e) => e.status === "running").length;
         const latestStatus = latestRunning > 0 ? `执行中 (${latestRunning})` : "工具调用";
-        const latestCard = FeishuClient.buildStreamingCard(latestContent, latestStatus);
+        const latestCard = FeishuClient.buildProgressCard(latestPanels, latestStatus);
         client?.updateCard(cardMsgId, latestCard).catch(() => {});
       }
     }).catch(() => {

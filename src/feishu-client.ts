@@ -694,11 +694,45 @@ export class FeishuClient {
     return FeishuClient.v2Card(elements);
   }
 
+  /** 构建进度卡片（状态行 + collapsible_panel 元素数组） */
+  static buildProgressCard(
+    panels: Record<string, unknown>[],
+    status?: string,
+  ): Record<string, unknown> {
+    const elements: Record<string, unknown>[] = [];
+
+    if (status) {
+      elements.push({ tag: "markdown", content: `**${status}**` });
+    }
+
+    elements.push(...panels);
+    return FeishuClient.v2Card(elements);
+  }
+
   /** 构建完成态卡片（支持完整 Markdown） */
   static buildFinalCard(text: string): Record<string, unknown> {
     return FeishuClient.v2Card([
       { tag: "markdown", content: FeishuClient.safeText(text) },
     ]);
+  }
+
+  /** 构建完成态进度卡片：面板 + 最终回复合并为一张卡片 */
+  static buildCompletedCard(
+    panels: Record<string, unknown>[],
+    finalText: string,
+    status?: string,
+  ): Record<string, unknown> {
+    const elements: Record<string, unknown>[] = [];
+
+    if (status) {
+      elements.push({ tag: "markdown", content: `**${status}**` });
+    }
+
+    elements.push(...panels);
+    elements.push({ tag: "hr" });
+    elements.push({ tag: "markdown", content: FeishuClient.safeText(finalText) });
+
+    return FeishuClient.v2Card(elements);
   }
 
   // ─── Reaction ──────────────────────────────────────────
