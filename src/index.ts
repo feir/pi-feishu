@@ -38,9 +38,10 @@ import type {
   AgentEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { Static } from "typebox";
-import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync, renameSync, realpathSync } from "node:fs";
+import { join, basename } from "node:path";
 import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { FeishuClient } from "./feishu-client.js";
 import type { InboundResource } from "./feishu-client.js";
 import type { FeishuConfig } from "./types.js";
@@ -50,6 +51,13 @@ import { summarizeArgs, errorSnippet, findEntryByCallId } from "./tool-summary.j
 
 /** 飞书 post 消息单条最大字符数（约 4000） */
 const MAX_TEXT_CHUNK = 4000;
+
+/** 运行时状态目录 */
+const STATE_DIR = join(homedir(), ".pi", "agent", "state");
+const PROJECTS_MD = join(homedir(), ".pi", "projects.md");
+const ACTIVE_PROJECT_FILE = join(STATE_DIR, "active-project");
+const RESTART_FLAG = join(STATE_DIR, "restart-flag");
+const LOCK_FILE = join(STATE_DIR, "pi-feishu.lock");
 
 /** 工具名到友好名称的映射 */
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
@@ -70,6 +78,133 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
 /** 友好化工具名 */
 function toolDisplayName(name: string): string {
   return TOOL_DISPLAY_NAMES[name] ?? name;
+}
+
+// ─── workspace-binding 协议 ───────────────────────────
+
+interface ActiveProject {
+  id: string;
+  root: string;
+  boundAt: string;
+  source: "id" | "path" | "manual";
+}
+
+/** 解析 ~/.pi/projects.md → Map<id, absolutePath> */
+function parseProjectsMd(): Map<string, string> {
+  const result = new Map<string, string>();
+  try {
+    if (!existsSync(PROJECTS_MD)) return result;
+    const content = readFileSync(PROJECTS_MD, "utf-8");
+    const lines = content.split("\n");
+    const seen = new Set<string>();
+    for (const line of lines) {
+      const match = line.match(/^\| *([a-z][a-z0-9-]*) *\| *(\S+) *\|/);
+      if (!match) continue;
+      const id = match[1];
+      if (id === "id") continue; // table header
+      let rawPath = match[2];
+      if (rawPath === "path") continue; // table header
+      if (rawPath.startsWith("~")) {
+        rawPath = join(homedir(), rawPath.slice(rawPath[1] === "/" ? 2 : 1));
+      }
+      if (seen.has(id)) {
+        console.warn(`[pi-feishu] projects.md: duplicate id "${id}", using first occurrence`);
+        continue;
+      }
+      seen.add(id);
+      result.set(id, rawPath);
+    }
+  } catch (err) {
+    console.warn(`[pi-feishu] failed to parse projects.md: ${err}`);
+  }
+  return result;
+}
+
+/** 读取 ~/.pi/agent/state/active-project */
+function readActiveProject(): ActiveProject | null {
+  try {
+    if (!existsSync(ACTIVE_PROJECT_FILE)) return null;
+    const content = readFileSync(ACTIVE_PROJECT_FILE, "utf-8");
+    const lines = content.split("\n");
+    const fields: Record<string, string> = {};
+    for (const line of lines) {
+      const m = line.match(/^(\w+):\s*(.*)$/);
+      if (m) fields[m[1]] = m[2].trim();
+    }
+    if (!fields.id || !fields.root || !fields.source) return null;
+    return {
+      id: fields.id,
+      root: fields.root,
+      boundAt: fields.bound_at || "",
+      source: fields.source as ActiveProject["source"],
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** 原子写入 active-project state file (tmpfile + rename) */
+function writeActiveProject(id: string, root: string, source: ActiveProject["source"]): void {
+  mkdirSync(STATE_DIR, { recursive: true });
+  const boundAt = new Date().toISOString();
+  const content = `id: ${id}\nroot: ${root}\nbound_at: ${boundAt}\nsource: ${source}\n`;
+  const tmp = `${ACTIVE_PROJECT_FILE}.${randomUUID()}`;
+  writeFileSync(tmp, content, "utf-8");
+  renameSync(tmp, ACTIVE_PROJECT_FILE);
+}
+
+/** 清除 active-project state file */
+function clearActiveProject(): void {
+  try { unlinkSync(ACTIVE_PROJECT_FILE); } catch { /* already gone */ }
+}
+
+/** touch restart-flag */
+function touchRestartFlag(): void {
+  mkdirSync(STATE_DIR, { recursive: true });
+  writeFileSync(RESTART_FLAG, "", "utf-8");
+}
+
+// ─── 入口自检 ──────────────────────────────────────
+
+function selfCheck(): void {
+  const expectedCwd = join(homedir(), ".pi", "agent");
+  const actualCwd = process.cwd();
+  const warnings: string[] = [];
+
+  if (actualCwd !== expectedCwd) {
+    warnings.push(
+      `cwd 异常: 期望 ${expectedCwd}, 实际 ${actualCwd}。` +
+      `建议用 ~/.pi/agent/bin/pi-feishu 启动。`,
+    );
+  }
+
+  try {
+    let rawPid: string;
+    try {
+      rawPid = readFileSync(LOCK_FILE, "utf-8").trim();
+    } catch {
+      rawPid = readFileSync(join(LOCK_FILE, "pid"), "utf-8").trim();
+    }
+    const lockPid = parseInt(rawPid, 10);
+    if (lockPid !== process.ppid) {
+      warnings.push(
+        `lock PID ${lockPid} 不是当前父进程 ${process.ppid}。可能不是由启动脚本拉起。`,
+      );
+    }
+  } catch {
+    warnings.push(`lock 缺失 ${LOCK_FILE}。建议用启动脚本起。`);
+  }
+
+  if (process.env.PI_FEISHU_ACTIVE !== "1") {
+    warnings.push(
+      `PI_FEISHU_ACTIVE 未设为 1。skill 将不读 active-project state file，` +
+      `/cd 切项目不会影响 .specs 路径解析。建议用 ~/.pi/agent/bin/pi-feishu 启动。`,
+    );
+  }
+
+  for (const w of warnings) {
+    console.warn(`[pi-feishu] ${w}`);
+  }
 }
 
 // ─── 从 Pi settings.json 读取 feishu 配置段 ──────────────
@@ -164,6 +299,47 @@ export default function (pi: ExtensionAPI) {
   /** 每个聊天的消息队列 */
   const chatQueues: Map<string, ChatQueue> = new Map();
 
+  /** 全局状态变更锁（/cd /update），防止并发切项目/更新 */
+  let mutationInProgress = false;
+
+  // ─── 安全门 ──────────────────────────────────────────
+
+  /** ctx 可能在 session replacement/reload 后 stale；所有访问都必须防崩。 */
+  function ctxIsIdle(): boolean {
+    try { return ctxRef?.isIdle() ?? true; } catch { ctxRef = null; return true; }
+  }
+
+  function ctxHasPendingMessages(): boolean {
+    try { return ctxRef?.hasPendingMessages?.() ?? false; } catch { ctxRef = null; return false; }
+  }
+
+  function ctxAbort(): void {
+    try { ctxRef?.abort(); } catch { ctxRef = null; }
+  }
+
+  function ctxCompact(): boolean {
+    try { ctxRef?.compact(); return true; } catch { ctxRef = null; return false; }
+  }
+
+  function ctxContextUsage(): ReturnType<ExtensionContext["getContextUsage"]> | undefined {
+    try { return ctxRef?.getContextUsage(); } catch { ctxRef = null; return undefined; }
+  }
+
+  function ctxShutdown(): void {
+    try { ctxRef?.shutdown(); } catch { ctxRef = null; process.exit(0); }
+  }
+
+  /** 检查当前是否安全执行全局状态变更（/cd /update） */
+  function safeToMutate(): boolean {
+    if (mutationInProgress) return false;
+    if (!ctxIsIdle()) return false;
+    if (ctxHasPendingMessages()) return false;
+    for (const q of chatQueues.values()) {
+      if (q.processing || q.queue.length > 0) return false;
+    }
+    return true;
+  }
+
   // ─── 注册 CLI 标志 ────────────────────────────────────
 
   pi.registerFlag("feishu-app-id", {
@@ -215,9 +391,9 @@ export default function (pi: ExtensionAPI) {
     config = { ...config, ...overrides };
 
     if (!config.appId || !config.appSecret) {
-      if (ctxRef?.hasUI) {
-        ctxRef.ui.notify("飞书连接失败：缺少 appId/appSecret", "error");
-      }
+      try {
+        if (ctxRef?.hasUI) ctxRef.ui.notify("飞书连接失败：缺少 appId/appSecret", "error");
+      } catch { ctxRef = null; }
       return;
     }
 
@@ -233,9 +409,9 @@ export default function (pi: ExtensionAPI) {
     try {
       await client.connect();
     } catch (err) {
-      if (ctxRef?.hasUI) {
-        ctxRef.ui.notify(`飞书连接错误: ${err}`, "error");
-      }
+      try {
+        if (ctxRef?.hasUI) ctxRef.ui.notify(`飞书连接错误: ${err}`, "error");
+      } catch { ctxRef = null; }
     }
   }
 
@@ -289,7 +465,14 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Pi 正忙（压缩中/流式中）→ 不出队，保持 processing=false 等空闲时再触发
-    if (ctxRef && !ctxRef.isIdle()) {
+    if (!ctxIsIdle()) {
+      queue.processing = false;
+      return;
+    }
+
+    // ponytail: client 可能在重连/双实例抢占时短暂为 null，等 flushAllQueues 重试
+    const feishu = client;
+    if (!feishu) {
       queue.processing = false;
       return;
     }
@@ -302,7 +485,7 @@ export default function (pi: ExtensionAPI) {
     // 下载入站媒体
     let resourceDescription = "";
     for (const res of item.resources) {
-      const localPath = await client!.downloadResource(
+      const localPath = await feishu.downloadResource(
         item.msgId,
         res.fileKey,
         res.type,
@@ -327,7 +510,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     // 添加 Typing Reaction
-    await client!.startTyping(chatId, item.msgId);
+    await feishu.startTyping(chatId, item.msgId);
 
     // 发送给 Pi
     const fullContent = item.text + (resourceDescription ? "\n" + resourceDescription : "");
@@ -365,13 +548,12 @@ export default function (pi: ExtensionAPI) {
         }
 
         // 中断当前处理
-        if (ctxRef && !ctxRef.isIdle()) {
-          ctxRef.abort();
+        if (!ctxIsIdle()) {
+          ctxAbort();
         }
 
         // 压缩上下文清除历史
-        if (ctxRef) {
-          ctxRef.compact();
+        if (ctxCompact()) {
           await client?.sendMessage(chatId, "会话已重置，上下文已清空。", msgId);
         } else {
           await client?.sendMessage(chatId, "无法重置：会话上下文不可用。", msgId);
@@ -394,8 +576,8 @@ export default function (pi: ExtensionAPI) {
           queue.processing = false;
         }
 
-        if (ctxRef && !ctxRef.isIdle()) {
-          ctxRef.abort();
+        if (!ctxIsIdle()) {
+          ctxAbort();
           await client?.sendMessage(chatId, "已中断当前处理，队列已清空。", msgId);
         } else if (clearedCount > 0) {
           await client?.sendMessage(chatId, `已清空 ${clearedCount} 条排队消息。`, msgId);
@@ -409,7 +591,7 @@ export default function (pi: ExtensionAPI) {
         const queue = chatQueues.get(chatId);
         const state = chatStates.get(chatId);
         const count = queue?.queue.length ?? 0;
-        const idle = ctxRef?.isIdle() ?? true;
+        const idle = ctxIsIdle();
 
         if (!state && count === 0) {
           await client?.sendMessage(chatId, "队列为空，当前空闲。", msgId);
@@ -424,8 +606,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       case "/compact": {
-        if (ctxRef) {
-          ctxRef.compact();
+        if (ctxCompact()) {
           await client?.sendMessage(chatId, "已触发上下文压缩。", msgId);
         } else {
           await client?.sendMessage(chatId, "无法执行：会话上下文不可用。", msgId);
@@ -435,7 +616,7 @@ export default function (pi: ExtensionAPI) {
 
       case "/status": {
         const status = client?.getStatus() ?? "未启动";
-        const ctxUsage = ctxRef?.getContextUsage();
+        const ctxUsage = ctxContextUsage();
         const queue = chatQueues.get(chatId);
         let reply = `Pi 状态:\n- 飞书连接: ${status}\n- App ID: ${config.appId ? "****" + config.appId.slice(-4) : "未设置"}`;
         if (ctxUsage && ctxUsage.tokens !== null) {
@@ -448,6 +629,35 @@ export default function (pi: ExtensionAPI) {
         break;
       }
 
+      case "/cd": {
+        if (!safeToMutate()) {
+          await client?.sendMessage(chatId, "pi 还在处理任务/队列，请稍后再 /cd", msgId);
+          break;
+        }
+        mutationInProgress = true;
+        try {
+          await handleCdCommand(chatId, msgId, args);
+        } finally {
+          mutationInProgress = false;
+        }
+        break;
+      }
+
+      case "/update": {
+        if (!safeToMutate()) {
+          await client?.sendMessage(chatId, "pi 还在处理任务/队列，请稍后再 /update", msgId);
+          break;
+        }
+        mutationInProgress = true;
+        let shutdownRequested = false;
+        try {
+          shutdownRequested = await handleUpdateCommand(chatId, msgId);
+        } finally {
+          if (!shutdownRequested) mutationInProgress = false;
+        }
+        break;
+      }
+
       case "/help": {
         const helpText = [
           "可用命令:",
@@ -456,6 +666,10 @@ export default function (pi: ExtensionAPI) {
           "  /queue     - 查看排队状态",
           "  /compact   - 压缩上下文",
           "  /status    - 查看 Pi 状态",
+          "  /cd        - 查看/切换活跃项目",
+          "  /cd <id>   - 绑定到 projects.md 注册的项目",
+          "  /cd --list  - 列出所有注册项目",
+          "  /update    - 拉取更新、构建并重启 pi-feishu",
           "  /help      - 显示帮助",
           "",
           "以下命令请在 Pi 终端中执行:",
@@ -475,6 +689,257 @@ export default function (pi: ExtensionAPI) {
         break;
       }
     }
+  }
+
+  // ─── /cd 命令处理 ───────────────────────────────────
+
+  async function handleCdCommand(
+    chatId: string,
+    msgId: string,
+    args: string,
+  ): Promise<void> {
+    const trimmed = args.trim();
+
+    // /cd (无参) → 查看当前绑定
+    if (!trimmed) {
+      const current = readActiveProject();
+      if (current) {
+        await client?.sendMessage(
+          chatId,
+          `当前绑定: **${current.id}**\n路径: ${current.root}\n绑定时间: ${current.boundAt}`,
+          msgId,
+        );
+      } else {
+        await client?.sendMessage(
+          chatId,
+          `未绑定项目，回退到 pi 启动目录: ${process.cwd()}`,
+          msgId,
+        );
+      }
+      return;
+    }
+
+    // /cd --list → 列出所有注册项目
+    if (trimmed === "--list" || trimmed === "-l") {
+      if (!existsSync(PROJECTS_MD)) {
+        await client?.sendMessage(chatId, "❌ 找不到 ~/.pi/projects.md", msgId);
+        return;
+      }
+      const projects = parseProjectsMd();
+      if (projects.size === 0) {
+        await client?.sendMessage(chatId, "projects.md 为空，暂无注册项目。", msgId);
+        return;
+      }
+      const current = readActiveProject();
+      const lines = [...projects.entries()].map(([id, path]) => {
+        const marker = current?.id === id ? " ★" : "";
+        return `- **${id}**${marker}: ${path}`;
+      });
+      await client?.sendMessage(
+        chatId,
+        `注册项目 (${projects.size}):\n${lines.join("\n")}`,
+        msgId,
+      );
+      return;
+    }
+
+    // /cd clear
+    if (trimmed === "clear") {
+      clearActiveProject();
+      await client?.sendMessage(chatId, "✅ 已清除绑定", msgId);
+      return;
+    }
+
+    // 判断是 path-like 还是纯 token
+    const isPathLike = /[\/~.]/.test(trimmed);
+
+    if (isPathLike) {
+      // /cd <path> → 直接 realpath 绑定
+      let resolved: string;
+      try {
+        let expanded = trimmed;
+        if (expanded.startsWith("~")) {
+          expanded = join(homedir(), expanded.slice(expanded[1] === "/" ? 2 : 1));
+        }
+        resolved = realpathSync(expanded);
+      } catch {
+        await client?.sendMessage(chatId, `❌ 路径不存在: ${trimmed}`, msgId);
+        return;
+      }
+
+      const id = basename(resolved);
+      writeActiveProject(id, resolved, "path");
+      await client?.sendMessage(
+        chatId,
+        `✅ 已绑定到 **${id}**: ${resolved}`,
+        msgId,
+      );
+      return;
+    }
+
+    // /cd <id> → 查 projects.md
+    if (!existsSync(PROJECTS_MD)) {
+      await client?.sendMessage(
+        chatId,
+        "❌ 找不到 ~/.pi/projects.md。用 `/cd <绝对路径>` 直接绑定。",
+        msgId,
+      );
+      return;
+    }
+
+    const projects = parseProjectsMd();
+    const root = projects.get(trimmed);
+
+    if (!root) {
+      const ids = [...projects.keys()].join(", ");
+      await client?.sendMessage(
+        chatId,
+        `❌ projects.md 无 **${trimmed}**。可用 id: ${ids || "(无)"}`,
+        msgId,
+      );
+      return;
+    }
+
+    // 校验目录存在，并写入 realpath 后的绝对路径
+    let resolvedRoot: string;
+    try {
+      resolvedRoot = realpathSync(root);
+    } catch {
+      await client?.sendMessage(
+        chatId,
+        `❌ projects.md 中 ${trimmed} 指向的路径不存在: ${root}`,
+        msgId,
+      );
+      return;
+    }
+
+    writeActiveProject(trimmed, resolvedRoot, "id");
+    await client?.sendMessage(
+      chatId,
+      `✅ 已绑定到 **${trimmed}**: ${resolvedRoot}`,
+      msgId,
+    );
+  }
+
+  // ─── /update 命令处理 ────────────────────────────────
+
+  async function handleUpdateCommand(
+    chatId: string,
+    msgId: string,
+  ): Promise<boolean> {
+    const FORK_DIR = join(homedir(), ".pi", "agent", "git", "github.com", "feir", "pi-feishu");
+
+    await client?.sendMessage(chatId, "🔄 准备更新...", msgId);
+
+    // Step 1: 检查工作区清洁
+    const statusResult = await pi.exec("git", ["status", "--porcelain"], { cwd: FORK_DIR, timeout: 10000 });
+    if (statusResult.code !== 0 || statusResult.stdout.trim() !== "") {
+      await client?.sendMessage(
+        chatId,
+        "❌ 工作区不干净（有未提交的改动）。请先提交或暂存改动后再 /update。",
+        msgId,
+      );
+      return false;
+    }
+
+    // Step 2: 记录 BEFORE_SHA
+    const beforeResult = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: FORK_DIR, timeout: 10000 });
+    if (beforeResult.code !== 0) {
+      await client?.sendMessage(chatId, `❌ 无法获取当前 HEAD: ${beforeResult.stderr}`, msgId);
+      return false;
+    }
+    const BEFORE_SHA = beforeResult.stdout.trim();
+
+    // Step 3: git pull --ff-only
+    const pullResult = await pi.exec("git", ["pull", "--ff-only"], { cwd: FORK_DIR, timeout: 60000 });
+    if (pullResult.code !== 0) {
+      await client?.sendMessage(
+        chatId,
+        `❌ git pull 失败:\n\`\`\`\n${pullResult.stderr.substring(0, 500)}\n\`\`\``,
+        msgId,
+      );
+      return false;
+    }
+
+    // Step 4: 检查是否有更新
+    const afterResult = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: FORK_DIR, timeout: 10000 });
+    const AFTER_SHA = afterResult.stdout.trim();
+    if (AFTER_SHA === BEFORE_SHA) {
+      const short = BEFORE_SHA.substring(0, 7);
+      await client?.sendMessage(chatId, `ℹ️ 已是最新 (${short})`, msgId);
+      return false;
+    }
+
+    // Step 5: npm ci
+    const ciResult = await pi.exec("npm", ["ci", "--silent"], { cwd: FORK_DIR, timeout: 120000 });
+    if (ciResult.code !== 0) {
+      const rolledBack = await rollbackToBefore(BEFORE_SHA);
+      await client?.sendMessage(
+        chatId,
+        `❌ npm ci 失败，${rolledBack ? "已回滚到更新前" : "回滚失败，请人工检查"}。`,
+        msgId,
+      );
+      return false;
+    }
+
+    // Step 6: 强制验证代码：有 build 跑 build，否则跑 typecheck
+    const pkgJson = JSON.parse(readFileSync(join(FORK_DIR, "package.json"), "utf-8"));
+    const validation = pkgJson.scripts?.build
+      ? { label: "build", args: ["run", "build"] }
+      : pkgJson.scripts?.typecheck
+        ? { label: "typecheck", args: ["run", "typecheck"] }
+        : null;
+
+    if (!validation) {
+      const rolledBack = await rollbackToBefore(BEFORE_SHA);
+      await client?.sendMessage(
+        chatId,
+        `❌ package.json 缺少 build/typecheck 脚本，${rolledBack ? "已回滚" : "回滚失败，请人工检查"}。`,
+        msgId,
+      );
+      return false;
+    }
+
+    const validationResult = await pi.exec("npm", validation.args, { cwd: FORK_DIR, timeout: 120000 });
+    if (validationResult.code !== 0) {
+      const rolledBack = await rollbackToBefore(BEFORE_SHA);
+      await client?.sendMessage(
+        chatId,
+        `❌ ${validation.label} 失败:\n\`\`\`\n${validationResult.stderr.substring(0, 500)}\n\`\`\`\n${rolledBack ? "已回滚到更新前。" : "回滚失败，请人工检查。"}`,
+        msgId,
+      );
+      return false;
+    }
+
+    // Step 7: 先回复成功，再 touch restart-flag + shutdown，避免发送失败留下 stale flag
+    const short = AFTER_SHA.substring(0, 7);
+    await client?.sendMessage(
+      chatId,
+      `✅ 已更新到 ${short}，重启中...`,
+      msgId,
+    );
+    touchRestartFlag();
+    ctxShutdown();
+    return true;
+  }
+
+  /** 回滚到 BEFORE_SHA：git reset + best-effort npm ci && build/typecheck */
+  async function rollbackToBefore(beforeSha: string): Promise<boolean> {
+    const FORK_DIR = join(homedir(), ".pi", "agent", "git", "github.com", "feir", "pi-feishu");
+    const resetResult = await pi.exec("git", ["reset", "--hard", beforeSha], { cwd: FORK_DIR, timeout: 30000 });
+    const resetOk = resetResult.code === 0;
+    try {
+      await pi.exec("npm", ["ci", "--silent"], { cwd: FORK_DIR, timeout: 120000 });
+    } catch { /* best-effort */ }
+    try {
+      const pkgJson = JSON.parse(readFileSync(join(FORK_DIR, "package.json"), "utf-8"));
+      if (pkgJson.scripts?.build) {
+        await pi.exec("npm", ["run", "build"], { cwd: FORK_DIR, timeout: 120000 });
+      } else if (pkgJson.scripts?.typecheck) {
+        await pi.exec("npm", ["run", "typecheck"], { cwd: FORK_DIR, timeout: 120000 });
+      }
+    } catch { /* best-effort */ }
+    return resetOk;
   }
 
   // ═══════════════════════════════════════════════════════
@@ -608,7 +1073,7 @@ export default function (pi: ExtensionAPI) {
    */
   function flushAllQueues(): void {
     if (!client || client.getStatus() !== "connected") return;
-    if (ctxRef && !ctxRef.isIdle()) return;
+    if (!ctxIsIdle()) return;
 
     for (const [chatId, queue] of chatQueues) {
       if (!queue.processing && queue.queue.length > 0) {
@@ -941,7 +1406,8 @@ export default function (pi: ExtensionAPI) {
       const filePath = params.file_path as string;
       const chatId = (params.chat_id as string) || findActiveState()?.chatId;
 
-      if (!client || client.getStatus() !== "connected") {
+      const feishuImg = client;
+      if (!feishuImg || feishuImg.getStatus() !== "connected") {
         return {
           content: [{ type: "text" as const, text: "错误: 飞书 Bot 未连接。" }],
           details: {} as Record<string, unknown>,
@@ -955,7 +1421,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const imageKey = await client.uploadImage(filePath);
+      const imageKey = await feishuImg.uploadImage(filePath);
       if (!imageKey) {
         return {
           content: [{ type: "text" as const, text: "错误: 图片上传失败。" }],
@@ -963,7 +1429,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      await client.sendImage(chatId, imageKey);
+      await feishuImg.sendImage(chatId, imageKey);
       return {
         content: [{ type: "text" as const, text: `图片已发送到飞书 [${chatId}]: ${filePath}` }],
         details: { sent: true, chatId, filePath, imageKey } as Record<string, unknown>,
@@ -1001,7 +1467,8 @@ export default function (pi: ExtensionAPI) {
       const fileName = params.file_name as string;
       const chatId = (params.chat_id as string) || findActiveState()?.chatId;
 
-      if (!client || client.getStatus() !== "connected") {
+      const feishuFile = client;
+      if (!feishuFile || feishuFile.getStatus() !== "connected") {
         return {
           content: [{ type: "text" as const, text: "错误: 飞书 Bot 未连接。" }],
           details: {} as Record<string, unknown>,
@@ -1015,7 +1482,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const fileKey = await client.uploadFile(filePath, fileName);
+      const fileKey = await feishuFile.uploadFile(filePath, fileName);
       if (!fileKey) {
         return {
           content: [{ type: "text" as const, text: "错误: 文件上传失败。" }],
@@ -1023,7 +1490,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      await client.sendFile(chatId, fileKey);
+      await feishuFile.sendFile(chatId, fileKey);
       return {
         content: [{ type: "text" as const, text: `文件已发送到飞书 [${chatId}]: ${fileName}` }],
         details: { sent: true, chatId, filePath, fileName, fileKey } as Record<string, unknown>,
@@ -1035,6 +1502,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     ctxRef = ctx;
+    selfCheck();
     updateStatus(ctx, "disconnected");
 
     try {
@@ -1113,44 +1581,52 @@ export default function (pi: ExtensionAPI) {
   let currentStatusText: string = "";
 
   function updateStatus(ctx: ExtensionContext | null, status: string): void {
-    if (!ctx?.hasUI) return;
+    try {
+      if (!ctx?.hasUI) return;
 
-    if (statusTimer) {
-      clearTimeout(statusTimer);
-      statusTimer = null;
+      if (statusTimer) {
+        clearTimeout(statusTimer);
+        statusTimer = null;
+      }
+
+      const statusMap: Record<string, string> = {
+        connecting: "飞书: 连接中",
+        connected: "飞书: 已连接",
+        disconnected: "飞书: 未连接",
+        error: "飞书: 错误",
+      };
+
+      const text = statusMap[status] ?? `飞书: ${status}`;
+      if (currentStatusText === text) return;
+      currentStatusText = text;
+      ctx.ui.setStatus("feishu", text);
+    } catch {
+      if (ctx === ctxRef) ctxRef = null;
     }
-
-    const statusMap: Record<string, string> = {
-      connecting: "飞书: 连接中",
-      connected: "飞书: 已连接",
-      disconnected: "飞书: 未连接",
-      error: "飞书: 错误",
-    };
-
-    const text = statusMap[status] ?? `飞书: ${status}`;
-    if (currentStatusText === text) return;
-    currentStatusText = text;
-    ctx.ui.setStatus("feishu", text);
   }
 
   function flashStatus(message: string): void {
-    if (!ctxRef?.hasUI) return;
-    if (statusTimer) clearTimeout(statusTimer);
+    try {
+      if (!ctxRef?.hasUI) return;
+      if (statusTimer) clearTimeout(statusTimer);
 
-    if (currentStatusText === message) return;
-    currentStatusText = message;
-    ctxRef.ui.setStatus("feishu", message);
+      if (currentStatusText === message) return;
+      currentStatusText = message;
+      ctxRef.ui.setStatus("feishu", message);
 
-    statusTimer = setTimeout(() => {
-      statusTimer = null;
-      if (client && client.getStatus() === "connected") {
-        const text = "飞书: 已连接";
-        if (currentStatusText !== text) {
-          currentStatusText = text;
-          ctxRef?.ui.setStatus("feishu", text);
-        }
-      }
-    }, 3000);
+      statusTimer = setTimeout(() => {
+        statusTimer = null;
+        try {
+          if (client && client.getStatus() === "connected") {
+            const text = "飞书: 已连接";
+            if (currentStatusText !== text) {
+              currentStatusText = text;
+              ctxRef?.ui.setStatus("feishu", text);
+            }
+          }
+        } catch { ctxRef = null; }
+      }, 3000);
+    } catch { ctxRef = null; }
   }
 
   function chunkText(text: string, maxLen: number): string[] {

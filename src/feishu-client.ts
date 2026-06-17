@@ -669,9 +669,12 @@ export class FeishuClient {
     };
   }
 
-  /** 截断过长文本 */
+  /** 截断过长文本，并禁用 Markdown 表格（飞书卡片有 table 数量上限） */
   private static safeText(text: string, limit = 3500): string {
-    return text.length > limit ? text.substring(0, limit) + "\n..." : text;
+    const clipped = text.length > limit ? text.substring(0, limit) + "\n..." : text;
+    // Feishu card markdown 会把以 | 开头的行解析成 table；多表会触发 230099/11310。
+    // 加零宽空格让它按普通文本渲染，保留视觉内容。
+    return clipped.replace(/^(\s*)\|/gm, "$1\u200B|");
   }
 
   /** 构建纯文本卡片（用于普通消息回复，支持完整 Markdown） */
