@@ -26,6 +26,7 @@
   "files": [
     "src/index.ts",
     "src/feishu-client.ts",
+    "src/tool-summary.ts",
     "src/types.ts"
   ],
   "pi": {

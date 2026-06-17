@@ -44,6 +44,7 @@ import { homedir } from "node:os";
 import { FeishuClient } from "./feishu-client.js";
 import type { InboundResource } from "./feishu-client.js";
 import type { FeishuConfig } from "./types.js";
+import { summarizeArgs, errorSnippet, findEntryByCallId } from "./tool-summary.js";
 
 // ─── 常量 ─────────────────────────────────────────────
 
@@ -125,7 +126,13 @@ interface ChatState {
   /** 卡片是否正在创建中（防止竞态重复创建） */
   progressCreating: boolean;
   /** 工具执行记录 */
-  toolEntries: Array<{ name: string; status: "running" | "done" | "error" }>;
+  toolEntries: Array<{
+    name: string;
+    status: "running" | "done" | "error";
+    toolCallId: string;
+    argSummary?: string;
+    errorSnippet?: string;
+  }>;
 }
 
 // ─── 扩展入口 ───────────────────────────────────────────
@@ -480,7 +487,9 @@ export default function (pi: ExtensionAPI) {
     if (!state) return;
 
     const toolName = event.toolName as string;
-    state.toolEntries.push({ name: toolName, status: "running" });
+    const toolCallId = event.toolCallId as string;
+    const argSummary = summarizeArgs(toolName, event.args);
+    state.toolEntries.push({ name: toolName, status: "running", toolCallId, argSummary });
 
     updateProgressCard(state);
     flashStatus(`飞书: 🔧 ${toolDisplayName(toolName)}...`);
@@ -493,15 +502,15 @@ export default function (pi: ExtensionAPI) {
     const state = findActiveState();
     if (!state) return;
 
-    const toolName = event.toolName as string;
+    const toolCallId = event.toolCallId as string;
     const isError = event.isError as boolean;
 
-    // 找到对应的 running 条目并更新状态
-    for (let i = state.toolEntries.length - 1; i >= 0; i--) {
-      if (state.toolEntries[i].name === toolName && state.toolEntries[i].status === "running") {
-        state.toolEntries[i].status = isError ? "error" : "done";
-        break;
-      }
+    const entry = findEntryByCallId(state.toolEntries, toolCallId);
+    if (!entry) return;
+
+    entry.status = isError ? "error" : "done";
+    if (isError) {
+      entry.errorSnippet = errorSnippet(event.result);
     }
 
     updateProgressCard(state);
@@ -621,15 +630,19 @@ export default function (pi: ExtensionAPI) {
 
     for (const entry of display) {
       const displayName = toolDisplayName(entry.name);
+      const detail = entry.argSummary ? ` · ${entry.argSummary}` : "";
       switch (entry.status) {
         case "running":
-          lines.push(`⏳ **${displayName}** ...`);
+          lines.push(`⏳ **${displayName}**${detail}`);
           break;
         case "done":
-          lines.push(`✅ ~~${displayName}~~`);
+          lines.push(`✅ ~~${displayName}~~${detail}`);
           break;
         case "error":
-          lines.push(`❌ **${displayName}**`);
+          lines.push(`❌ **${displayName}**${detail}`);
+          if (entry.errorSnippet) {
+            lines.push(`   ↳ ${entry.errorSnippet}`);
+          }
           break;
       }
     }

@@ -172,7 +172,9 @@ export class FeishuClient {
         appId: this.config.appId,
         appSecret: this.config.appSecret,
         domain,
-        loggerLevel: Lark.LoggerLevel.info,
+        // warn-level: 隐藏 SDK 的 "ws client ready" / "client ready" 等常规 info 日志，
+        // 只保留重连 / 握手超时 / 关闭等需要关注的事件
+        loggerLevel: Lark.LoggerLevel.warn,
         autoReconnect: true,
         handshakeTimeoutMs: 15000,
         wsConfig: {
