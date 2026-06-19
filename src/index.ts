@@ -743,6 +743,14 @@ export default function (pi: ExtensionAPI) {
         break;
       }
 
+      case "/restart": {
+        await client?.sendMessage(chatId, "🔄 正在重启 pi-feishu...", msgId);
+        touchRestartFlag();
+        // 给飞书消息一点时间送达
+        setTimeout(() => ctxShutdown(), 300);
+        break;
+      }
+
       case "/help": {
         const helpText = [
           "可用命令:",
@@ -752,6 +760,7 @@ export default function (pi: ExtensionAPI) {
           "  /compact   - 压缩上下文",
           "  /status    - 查看 Pi 状态",
           "  /quota     - 查看模型配额",
+          "  /restart   - 重启 pi-feishu",
           "  /cd        - 查看/切换活跃项目",
           "  /cd <id>   - 绑定到 projects.md 注册的项目",
           "  /cd --list  - 列出所有注册项目",
