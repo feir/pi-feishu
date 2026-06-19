@@ -16,6 +16,18 @@ export interface FeishuConfig {
   encryptKey?: string;
   /** 事件验证令牌（可选） */
   verificationToken?: string;
+  /** 允许的发送者 open_id 白名单（空 = 不限制） */
+  allowedOpenIds?: string[];
+  /** 允许的聊天 chat_id 白名单 */
+  allowedChatIds?: string[];
+  /** 显式允许任意发送者（默认 false；不建议公网 bot 使用） */
+  allowAnySender?: boolean;
+  /** Bot open_id，用于校验群聊是否精确 @机器人 */
+  botOpenId?: string;
+  /** 群聊消息是否要求 @机器人（默认 true；chat 白名单可绕过） */
+  requireMentionInGroup?: boolean;
+  /** 入站媒体最大字节数（默认 50MB） */
+  maxInboundMediaBytes?: number;
 }
 
 /** 桥接服务状态 */
@@ -28,4 +40,10 @@ export interface FeishuSettingsSection {
   domain?: string;
   encryptKey?: string;
   verificationToken?: string;
+  allowedOpenIds?: string[];
+  allowedChatIds?: string[];
+  allowAnySender?: boolean;
+  botOpenId?: string;
+  requireMentionInGroup?: boolean;
+  maxInboundMediaBytes?: number;
 }

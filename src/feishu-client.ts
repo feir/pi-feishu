@@ -9,7 +9,7 @@
  */
 
 import * as Lark from "@larksuiteoapi/node-sdk";
-import { writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { FeishuConfig, BridgeStatus } from "./types.js";
@@ -33,7 +33,9 @@ const DEDUP_MAX_ENTRIES = 5000;
 /** 去重定期清理间隔（5 分钟） */
 const DEDUP_SWEEP_INTERVAL = 5 * 60 * 1000;
 /** 消息过期判定（30 分钟） */
-const MESSAGE_EXPIRY_MS = 30 * 60 * 60 * 1000;
+const MESSAGE_EXPIRY_MS = 30 * 60 * 1000;
+/** 入站媒体默认最大字节数（50MB） */
+const DEFAULT_MAX_INBOUND_MEDIA_BYTES = 50 * 1024 * 1024;
 /** 媒体文件临时目录 */
 const MEDIA_TEMP_DIR = join(tmpdir(), "feishu-media");
 /** 飞书 Reaction emoji 类型 */
@@ -113,8 +115,22 @@ export class FeishuClient {
   // Reaction 跟踪：chatId → { msgId, reactionId }
   private typingMessages: Map<string, { msgId: string; reactionId: string }> = new Map();
 
+  // 入站授权配置（缓存于实例）
+  private allowedOpenIds: string[];
+  private allowedChatIds: string[];
+  private allowAnySender: boolean;
+  private requireMentionInGroup: boolean;
+  private maxInboundMediaBytes: number;
+
   constructor(private config: FeishuConfig) {
     const domain = config.domain === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
+
+    this.allowedOpenIds = config.allowedOpenIds ?? [];
+    this.allowedChatIds = config.allowedChatIds ?? [];
+    this.allowAnySender = config.allowAnySender ?? false;
+    this.botOpenId = config.botOpenId ?? "";
+    this.requireMentionInGroup = config.requireMentionInGroup ?? true;
+    this.maxInboundMediaBytes = config.maxInboundMediaBytes ?? DEFAULT_MAX_INBOUND_MEDIA_BYTES;
 
     this.client = new Lark.Client({
       appId: config.appId,
@@ -273,6 +289,7 @@ export class FeishuClient {
           data: { receive_id: chatId, content, msg_type: "interactive" },
         });
       } else {
+        _warn("Send message failed:", err?.code ?? "", err?.message ?? err);
         throw err;
       }
     }
@@ -316,7 +333,7 @@ export class FeishuClient {
 
   // ─── 媒体收发 ──────────────────────────────────────────
 
-  /** 下载消息中的资源（图片/文件）到本地临时目录 */
+  /** 下载消息中的资源（图片/文件）到本地临时目录，受 maxInboundMediaBytes 限制 */
   async downloadResource(
     messageId: string,
     fileKey: string,
@@ -334,6 +351,7 @@ export class FeishuClient {
       if (!resp) return null;
 
       // SDK 返回 { writeFile, getReadableStream, headers }
+
       // 生成文件名
       const ext = resourceType === "image" ? ".png" : resourceType === "audio" ? ".ogg" : "";
       const safeName = (fileName && fileName.length > 0)
@@ -341,23 +359,56 @@ export class FeishuClient {
         : `${fileKey}${ext}`;
       const localPath = join(MEDIA_TEMP_DIR, `${Date.now()}-${safeName}`);
 
-      // 优先使用 writeFile()（SDK 原生写入磁盘）
-      if (typeof resp.writeFile === "function") {
+      const maxBytes = this.maxInboundMediaBytes;
+
+      // ── content-length gate ──
+      const contentLength = this.extractContentLength(resp);
+      if (contentLength !== null && contentLength > maxBytes) {
+        _warn(`Resource ${fileKey} too large: ${contentLength} > ${maxBytes} bytes, rejected`);
+        return null;
+      }
+
+      // 优先使用 writeFile()（SDK 原生写入磁盘），但仅在有 content-length 且未超限时使用
+      if (typeof resp.writeFile === "function" && contentLength !== null) {
         await resp.writeFile(localPath);
         _log(`Resource downloaded via writeFile to ${localPath}`);
         return localPath;
       }
 
-      // 回退：使用 getReadableStream() 手动收集
+      // stream fallback：有 getReadableStream 时逐块限流
       if (typeof resp.getReadableStream === "function") {
+        const { createWriteStream } = await import("node:fs");
         const stream = resp.getReadableStream();
-        const chunks: Buffer[] = [];
-        for await (const chunk of stream as AsyncIterable<Buffer>) {
-          chunks.push(Buffer.from(chunk));
+        const sink = createWriteStream(localPath);
+        const finished = new Promise<void>((resolve, reject) => {
+          sink.on("finish", resolve);
+          sink.on("error", reject);
+        });
+        let totalBytes = 0;
+
+        try {
+          for await (const chunk of stream as AsyncIterable<Buffer>) {
+            totalBytes += chunk.length;
+            if (totalBytes > maxBytes) {
+              sink.destroy();
+              _warn(`Resource ${fileKey} exceeded max ${maxBytes} bytes during stream, aborted`);
+              // 清理部分写入的文件
+              try { unlinkSync(localPath); } catch { /* best-effort */ }
+              return null;
+            }
+            sink.write(chunk);
+          }
+          sink.end();
+        } catch (streamErr) {
+          sink.destroy();
+          try { unlinkSync(localPath); } catch { /* best-effort */ }
+          throw streamErr;
         }
-        const buffer = Buffer.concat(chunks);
-        writeFileSync(localPath, buffer);
-        _log(`Resource downloaded via stream to ${localPath} (${buffer.length} bytes)`);
+
+        // 等待 write stream 完成
+        await finished;
+
+        _log(`Resource downloaded via stream to ${localPath} (${totalBytes} bytes)`);
         return localPath;
       }
 
@@ -365,6 +416,33 @@ export class FeishuClient {
       return null;
     } catch (err) {
       _warn("Download resource failed:", err);
+      return null;
+    }
+  }
+
+  /** 从 SDK response 中提取 content-length（字节） */
+  private extractContentLength(resp: any): number | null {
+    try {
+      const headers = resp?.headers;
+      if (!headers) return null;
+      // headers 可能是 Map / plain object / array of tuples
+      if (headers instanceof Map) {
+        for (const [k, v] of headers) {
+          if (String(k).toLowerCase() === "content-length") return parseInt(String(v), 10) || null;
+        }
+      }
+      if (Array.isArray(headers)) {
+        for (const [k, v] of headers) {
+          if (String(k).toLowerCase() === "content-length") return parseInt(String(v), 10) || null;
+        }
+      }
+      if (typeof headers === "object") {
+        for (const [k, v] of Object.entries(headers)) {
+          if (k.toLowerCase() === "content-length") return parseInt(String(v), 10) || null;
+        }
+      }
+      return null;
+    } catch {
       return null;
     }
   }
@@ -502,7 +580,7 @@ export class FeishuClient {
   }
 
   /** 处理入站消息事件 */
-  private handleInboundMessage(data: FeishuMessageEvent): void {
+  private async handleInboundMessage(data: FeishuMessageEvent): Promise<void> {
     try {
       const msg = data.message;
       const sender = data.sender;
@@ -510,22 +588,43 @@ export class FeishuClient {
       if (msg.create_time && this.isMessageExpired(msg.create_time)) return;
       if (!this.tryRecordDedup(msg.message_id)) return;
 
+      // 过滤 bot/app 消息
       const senderType = sender.sender_type;
       if (senderType === "bot" || senderType === "app") return;
 
+      // ── 入站授权 ──
+      const senderOpenId = sender.sender_id?.open_id;
       const chatId = msg.chat_id;
       const chatType = msg.chat_type;
+
+      const senderAllowed = !!senderOpenId && this.allowedOpenIds.includes(senderOpenId);
+      const chatAllowed = this.allowedChatIds.includes(chatId);
+
+      // 默认 fail-closed：必须命中 sender/chat 白名单，或显式 allowAnySender=true。
+      if (!this.allowAnySender && !senderAllowed && !chatAllowed) {
+        _warn(`Auth denied: sender=${senderOpenId}, chat=${chatId} not allowlisted`);
+        return;
+      }
+
+      // 群聊 @ 检查：chat 白名单可绕过；否则默认必须精确 @bot。
+      if (chatType === "group" && this.requireMentionInGroup && !chatAllowed) {
+        const mentions = msg.mentions ?? [];
+        const mentionedBot = this.botOpenId
+          ? mentions.some((m) => m.id.open_id === this.botOpenId)
+          // ponytail: no botOpenId means exact mention is unknowable; only explicit allowAnySender may use loose mention fallback.
+          : this.allowAnySender && mentions.length > 0;
+        if (!mentionedBot) {
+          _warn(`Auth denied: sender=${senderOpenId}, chat=${chatId} did not mention bot`);
+          return;
+        }
+      }
+
       const messageId = msg.message_id;
 
       // 解析消息内容和资源
-      const { text, resources } = this.parseContentWithResources(msg.content, msg.message_type, msg.mentions);
+      const { text, resources } = await this.parseContentWithResources(msg.content, msg.message_type, msg.mentions, messageId);
 
       if (!text && resources.length === 0) return;
-
-      _log(
-        `Inbound: chatId=${chatId}, type=${chatType}, msgId=${messageId}, ` +
-        `text=${(text ?? "").substring(0, 50)}..., resources=${resources.length}`,
-      );
 
       this.onMessageCallback?.(chatId, messageId, text ?? "", chatType, resources);
     } catch (err) {
@@ -539,11 +638,12 @@ export class FeishuClient {
    * 解析消息内容和资源列表。
    * 媒体类型的消息会返回占位文本 + 资源描述，由 index.ts 决定是否下载。
    */
-  private parseContentWithResources(
+  private async parseContentWithResources(
     rawContent: string,
     messageType: string,
     mentions?: FeishuMessageEvent["message"]["mentions"],
-  ): { text: string; resources: InboundResource[] } {
+    messageId?: string,
+  ): Promise<{ text: string; resources: InboundResource[] }> {
     let parsed: any;
     try {
       parsed = JSON.parse(rawContent);
@@ -630,7 +730,11 @@ export class FeishuClient {
         break;
 
       case "merge_forward":
-        text = "[合并转发消息]";
+        if (messageId) {
+          text = await this.fetchMergeForwardContent(messageId) ?? "[合并转发消息]";
+        } else {
+          text = "[合并转发消息]";
+        }
         break;
 
       default:
@@ -659,6 +763,153 @@ export class FeishuClient {
     return result;
   }
 
+  /** 从 post 消息的 content JSON 提取纯文本（精简版，用于转发子消息） */
+  private formatPostContentSimple(content: any): string {
+    const locale = content?.zh_cn ?? content?.en_us ?? content?.ja_jp;
+    if (!locale) return "[富文本消息]";
+    const parts: string[] = [];
+    if (locale.title) parts.push(locale.title);
+    if (Array.isArray(locale.content)) {
+      for (const row of locale.content) {
+        if (Array.isArray(row)) {
+          for (const elem of row) {
+            if (elem?.tag === "text" && elem.text) parts.push(elem.text);
+            else if (elem?.tag === "a" && elem.text) parts.push(elem.text);
+            else if (elem?.tag === "md" && elem.text) parts.push(elem.text);
+            else if (elem?.tag === "at") parts.push(elem.user_id ?? "");
+            else if (elem?.tag === "img") parts.push("[图片]");
+            else if (elem?.tag === "emotion") parts.push(elem.emoji_type ?? "[表情]");
+          }
+        }
+      }
+    }
+    return parts.join("");
+  }
+
+  /**
+   * 通过飞书 API GET /im/v1/messages/{messageId} 展开合并转发消息的子消息。
+   * 返回 XML 格式文本，失败返回 null。
+   */
+  private async fetchMergeForwardContent(messageId: string): Promise<string | null> {
+    try {
+      const resp = await this.client.request({
+        method: "GET",
+        url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`,
+        params: {
+          user_id_type: "open_id",
+          card_msg_content_type: "raw_card_content",
+        },
+      }) as any;
+
+      const items: any[] = resp?.data?.items;
+      if (!Array.isArray(items) || items.length === 0) return null;
+
+      // Build children map: parent_id -> [child_items]
+      const childrenMap = new Map<string, any[]>();
+      for (const item of items) {
+        const itemId = item.message_id;
+        const upper = item.upper_message_id;
+        // ponytail: skip root container itself
+        if (itemId === messageId && !upper) continue;
+        const parent = upper || messageId;
+        if (!childrenMap.has(parent)) childrenMap.set(parent, []);
+        childrenMap.get(parent)!.push(item);
+      }
+
+      // Sort by create_time ascending
+      const safeTs = (x: any) => parseInt(String(x.create_time || "0").slice(0, 13)) || 0;
+      for (const children of childrenMap.values()) {
+        children.sort((a, b) => safeTs(a) - safeTs(b));
+      }
+
+      const MAX_DEPTH = 10;
+      const bjTz = (ms: number): string => {
+        const d = new Date(ms);
+        const h = String(d.getUTCHours() + 8).padStart(2, "0");
+        return `${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")} ${h}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+      };
+
+      const formatSubtree = (
+        parentId: string,
+        depth = 0,
+        ancestors: Set<string> = new Set(),
+      ): string => {
+        if (depth > MAX_DEPTH || ancestors.has(parentId)) return "[合并转发消息 (嵌套过深)]";
+        ancestors.add(parentId);
+        const children = childrenMap.get(parentId);
+        if (!children || children.length === 0) return "";
+
+        const indent = "  ".repeat(depth);
+        const parts: string[] = [];
+
+        for (const child of children) {
+          const msgType = child.msg_type || "text";
+          const senderId = child.sender?.id || "unknown";
+
+          let tsStr = "";
+          if (child.create_time) {
+            try {
+              tsStr = bjTz(safeTs(child));
+            } catch { /* keep empty */ }
+          }
+
+          const raw = child.body?.content || "{}";
+          let ct: any = {};
+          try { ct = JSON.parse(raw); } catch { /* keep empty */ }
+
+          let childText = "";
+          if (msgType === "merge_forward") {
+            childText = child.message_id
+              ? formatSubtree(child.message_id, depth + 1, ancestors)
+              : "[合并转发消息]";
+          } else if (msgType === "text") {
+            childText = ct.text || "";
+          } else if (msgType === "post") {
+            childText = this.formatPostContentSimple(ct);
+          } else if (msgType === "interactive") {
+            // ponytail: skip fetch_card_content; interactive sub-messages are rare in forwards
+            childText = "[卡片消息]";
+          } else if (msgType === "image") {
+            childText = "[图片]";
+          } else if (msgType === "file") {
+            childText = `[文件: ${ct.file_name || "附件"}]`;
+          } else if (msgType === "sticker") {
+            childText = "[表情]";
+          } else if (msgType === "media") {
+            childText = `[媒体: ${ct.file_name || "媒体"}]`;
+          } else {
+            childText = `[${msgType}]`;
+          }
+
+          const lineHdr = tsStr
+            ? `${indent}[${tsStr}] ${senderId}:`
+            : `${indent}${senderId}:`;
+          const indented = childText.split("\n").map((l) => `${indent}  ${l}`).join("\n");
+          parts.push(`${lineHdr}\n${indented}`);
+        }
+
+        return parts.join("\n");
+      };
+
+      const formatted = formatSubtree(messageId);
+      if (!formatted) return null;
+
+      // Truncate
+      const MAX_LEN = 8000;
+      const WRAPPER = `<forwarded_messages>\n\n</forwarded_messages>`;
+      const SUFFIX = "\n... (转发消息过长，已截断)";
+      const budget = MAX_LEN - WRAPPER.length - SUFFIX.length;
+      const final = formatted.length > budget
+        ? formatted.slice(0, budget) + SUFFIX
+        : formatted;
+
+      return `<forwarded_messages>\n${final}\n</forwarded_messages>`;
+    } catch (err) {
+      _warn("fetchMergeForwardContent error:", err);
+      return null;
+    }
+  }
+
   // ─── 交互卡片构建 ──────────────────────────────────────
 
   /** v2 卡片外壳 */
@@ -670,7 +921,8 @@ export class FeishuClient {
   }
 
   /** 截断过长文本，并禁用 Markdown 表格（飞书卡片有 table 数量上限） */
-  private static safeText(text: string, limit = 3500): string {
+  // ponytail: interactive card JSON ≤ 30KB; markdown 内容预留 ~20KB 是安全的
+  private static safeText(text: string, limit = 20000): string {
     const clipped = text.length > limit ? text.substring(0, limit) + "\n..." : text;
     // Feishu card markdown 会把以 | 开头的行解析成 table；多表会触发 230099/11310。
     // 加零宽空格让它按普通文本渲染，保留视觉内容。
@@ -824,7 +1076,8 @@ export class FeishuClient {
     if (this.dedupSweepTimer.unref) this.dedupSweepTimer.unref();
   }
 
-  private isMessageExpired(createTimeStr: string): boolean {
+  /** @internal 暴露给测试 */
+  isMessageExpired(createTimeStr: string): boolean {
     const createTime = parseInt(createTimeStr, 10);
     if (isNaN(createTime)) return false;
     return Date.now() - createTime > MESSAGE_EXPIRY_MS;

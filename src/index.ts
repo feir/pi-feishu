@@ -39,9 +39,10 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { Static } from "typebox";
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync, renameSync, realpathSync } from "node:fs";
-import { join, basename } from "node:path";
+import { join, basename, dirname } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { FeishuClient } from "./feishu-client.js";
 import type { InboundResource } from "./feishu-client.js";
 import type { FeishuConfig } from "./types.js";
@@ -49,8 +50,8 @@ import { summarizeArgs, errorSnippet, findEntryByCallId } from "./tool-summary.j
 
 // ─── 常量 ─────────────────────────────────────────────
 
-/** 飞书 post 消息单条最大字符数（约 4000） */
-const MAX_TEXT_CHUNK = 4000;
+// ponytail: interactive card JSON ≤ 30KB, safeText 上限 20000；chunking 仅用于中间轮工具调用文本
+const MAX_TEXT_CHUNK = 20000;
 
 /** 运行时状态目录 */
 const STATE_DIR = join(homedir(), ".pi", "agent", "state");
@@ -209,7 +210,7 @@ function selfCheck(): void {
 
 // ─── 从 Pi settings.json 读取 feishu 配置段 ──────────────
 
-function readFeishuFromSettingsFile(filePath: string): Record<string, string> {
+function readFeishuFromSettingsFile(filePath: string): Record<string, unknown> {
   try {
     if (!existsSync(filePath)) return {};
     const raw = readFileSync(filePath, "utf-8");
@@ -222,10 +223,36 @@ function readFeishuFromSettingsFile(filePath: string): Record<string, string> {
       domain: fs.domain ?? "",
       encryptKey: fs.encryptKey ?? fs.encrypt_key ?? "",
       verificationToken: fs.verificationToken ?? fs.verification_token ?? "",
+      allowedOpenIds: fs.allowedOpenIds ?? fs.allowed_open_ids ?? [],
+      allowedChatIds: fs.allowedChatIds ?? fs.allowed_chat_ids ?? [],
+      allowAnySender: fs.allowAnySender ?? fs.allow_any_sender,
+      botOpenId: fs.botOpenId ?? fs.bot_open_id ?? "",
+      requireMentionInGroup: fs.requireMentionInGroup ?? fs.require_mention_in_group,
+      maxInboundMediaBytes: fs.maxInboundMediaBytes ?? fs.max_inbound_media_bytes,
     };
   } catch {
     return {};
   }
+}
+
+function parseList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String).filter(Boolean);
+  if (typeof value === "string") return value.split(",").map((s) => s.trim()).filter(Boolean);
+  return [];
+}
+
+function parseBool(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    if (["1", "true", "yes"].includes(value.toLowerCase())) return true;
+    if (["0", "false", "no"].includes(value.toLowerCase())) return false;
+  }
+  return undefined;
+}
+
+function parsePositiveInt(value: unknown): number | undefined {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
 }
 
 function loadConfig(): FeishuConfig {
@@ -235,16 +262,24 @@ function loadConfig(): FeishuConfig {
   const projectSettings = readFeishuFromSettingsFile(
     join(process.cwd(), ".pi", "settings.json"),
   );
-  const s: Record<string, string> = { ...globalSettings, ...projectSettings };
+  const s: Record<string, unknown> = { ...globalSettings, ...projectSettings };
 
   const domain = (process.env.FEISHU_DOMAIN || s.domain || "feishu") as "feishu" | "lark";
+  const allowAnySender = parseBool(process.env.FEISHU_ALLOW_ANY_SENDER ?? s.allowAnySender);
+  const requireMentionInGroup = parseBool(process.env.FEISHU_REQUIRE_MENTION_IN_GROUP ?? s.requireMentionInGroup);
 
   return {
-    appId: process.env.FEISHU_APP_ID || s.appId || "",
-    appSecret: process.env.FEISHU_APP_SECRET || s.appSecret || "",
+    appId: String(process.env.FEISHU_APP_ID || s.appId || ""),
+    appSecret: String(process.env.FEISHU_APP_SECRET || s.appSecret || ""),
     domain,
-    encryptKey: process.env.FEISHU_ENCRYPT_KEY || s.encryptKey || undefined,
-    verificationToken: process.env.FEISHU_VERIFICATION_TOKEN || s.verificationToken || undefined,
+    encryptKey: String(process.env.FEISHU_ENCRYPT_KEY || s.encryptKey || "") || undefined,
+    verificationToken: String(process.env.FEISHU_VERIFICATION_TOKEN || s.verificationToken || "") || undefined,
+    allowedOpenIds: parseList(process.env.FEISHU_ALLOWED_OPEN_IDS ?? s.allowedOpenIds),
+    allowedChatIds: parseList(process.env.FEISHU_ALLOWED_CHAT_IDS ?? s.allowedChatIds),
+    allowAnySender,
+    botOpenId: String(process.env.FEISHU_BOT_OPEN_ID || s.botOpenId || "") || undefined,
+    requireMentionInGroup,
+    maxInboundMediaBytes: parsePositiveInt(process.env.FEISHU_MAX_INBOUND_MEDIA_BYTES ?? s.maxInboundMediaBytes),
   };
 }
 
@@ -367,6 +402,36 @@ export default function (pi: ExtensionAPI) {
     type: "string",
     default: "",
   });
+  pi.registerFlag("feishu-allowed-open-ids", {
+    description: "允许的发送者 open_id，逗号分隔（可选）",
+    type: "string",
+    default: "",
+  });
+  pi.registerFlag("feishu-allowed-chat-ids", {
+    description: "允许的 chat_id，逗号分隔（可选）",
+    type: "string",
+    default: "",
+  });
+  pi.registerFlag("feishu-allow-any-sender", {
+    description: "显式允许任意发送者 (true/false，默认 false)",
+    type: "string",
+    default: "",
+  });
+  pi.registerFlag("feishu-bot-open-id", {
+    description: "Bot open_id，用于精确校验群聊 @机器人（可选）",
+    type: "string",
+    default: "",
+  });
+  pi.registerFlag("feishu-require-mention-in-group", {
+    description: "群聊是否要求 @机器人 (true/false，默认 true)",
+    type: "string",
+    default: "",
+  });
+  pi.registerFlag("feishu-max-inbound-media-bytes", {
+    description: "入站媒体最大字节数（默认 50MB）",
+    type: "string",
+    default: "",
+  });
 
   // ─── 启动飞书客户端 ──────────────────────────────────
 
@@ -388,6 +453,19 @@ export default function (pi: ExtensionAPI) {
       const val = pi.getFlag(flag);
       if (val) (overrides as any)[key] = String(val);
     }
+    const allowedOpenIdsFlag = pi.getFlag("feishu-allowed-open-ids");
+    if (allowedOpenIdsFlag) overrides.allowedOpenIds = parseList(String(allowedOpenIdsFlag));
+    const allowedChatIdsFlag = pi.getFlag("feishu-allowed-chat-ids");
+    if (allowedChatIdsFlag) overrides.allowedChatIds = parseList(String(allowedChatIdsFlag));
+    const allowAnySenderFlag = pi.getFlag("feishu-allow-any-sender");
+    if (allowAnySenderFlag) overrides.allowAnySender = parseBool(String(allowAnySenderFlag));
+    const botOpenIdFlag = pi.getFlag("feishu-bot-open-id");
+    if (botOpenIdFlag) overrides.botOpenId = String(botOpenIdFlag);
+    const requireMentionFlag = pi.getFlag("feishu-require-mention-in-group");
+    if (requireMentionFlag) overrides.requireMentionInGroup = parseBool(String(requireMentionFlag));
+    const maxMediaFlag = pi.getFlag("feishu-max-inbound-media-bytes");
+    if (maxMediaFlag) overrides.maxInboundMediaBytes = parsePositiveInt(String(maxMediaFlag));
+
     config = { ...config, ...overrides };
 
     if (!config.appId || !config.appSecret) {
@@ -400,7 +478,9 @@ export default function (pi: ExtensionAPI) {
     client = new FeishuClient(config);
 
     client.setOnMessage((chatId, msgId, text, chatType, resources) => {
-      handleFeishuMessage(chatId, msgId, text, chatType, resources);
+      handleFeishuMessage(chatId, msgId, text, chatType, resources).catch((err) => {
+        console.warn("[pi-feishu] handleFeishuMessage failed:", err?.message ?? err);
+      });
     });
     client.setOnStatusChange((status) => {
       updateStatus(ctxRef, status);
@@ -658,6 +738,11 @@ export default function (pi: ExtensionAPI) {
         break;
       }
 
+      case "/quota": {
+        await handleQuotaCommand(chatId, msgId);
+        break;
+      }
+
       case "/help": {
         const helpText = [
           "可用命令:",
@@ -666,6 +751,7 @@ export default function (pi: ExtensionAPI) {
           "  /queue     - 查看排队状态",
           "  /compact   - 压缩上下文",
           "  /status    - 查看 Pi 状态",
+          "  /quota     - 查看模型配额",
           "  /cd        - 查看/切换活跃项目",
           "  /cd <id>   - 绑定到 projects.md 注册的项目",
           "  /cd --list  - 列出所有注册项目",
@@ -821,18 +907,47 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  // ─── 包根路径推导 ─────────────────────────────────
+
+  /**
+   * 从 import.meta.url 向上查找 package.json name=pi-feishu，
+   * 避免硬编码路径（如 ~/.pi/agent/git/github.com/feir/pi-feishu）。
+   * 回退到 process.cwd()，保持与硬编码路径的行为兼容。
+   */
+  function resolvePackageRoot(): string {
+    try {
+      const currentFile = fileURLToPath(import.meta.url);
+      let dir = dirname(currentFile);
+      const root = "/";
+      while (dir !== root) {
+        try {
+          const pkgPath = join(dir, "package.json");
+          if (existsSync(pkgPath)) {
+            const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+            if (pkg.name === "pi-feishu") return realpathSync(dir);
+          }
+        } catch { /* try parent */ }
+        const parent = dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+      }
+    } catch { /* fall through */ }
+    // 回退到当前源码编译运行的 cwd，兼容现有行为
+    return realpathSync(process.cwd());
+  }
+
   // ─── /update 命令处理 ────────────────────────────────
 
   async function handleUpdateCommand(
     chatId: string,
     msgId: string,
   ): Promise<boolean> {
-    const FORK_DIR = join(homedir(), ".pi", "agent", "git", "github.com", "feir", "pi-feishu");
+    const PKG_ROOT = resolvePackageRoot();
 
     await client?.sendMessage(chatId, "🔄 准备更新...", msgId);
 
     // Step 1: 检查工作区清洁
-    const statusResult = await pi.exec("git", ["status", "--porcelain"], { cwd: FORK_DIR, timeout: 10000 });
+    const statusResult = await pi.exec("git", ["status", "--porcelain"], { cwd: PKG_ROOT, timeout: 10000 });
     if (statusResult.code !== 0 || statusResult.stdout.trim() !== "") {
       await client?.sendMessage(
         chatId,
@@ -843,7 +958,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Step 2: 记录 BEFORE_SHA
-    const beforeResult = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: FORK_DIR, timeout: 10000 });
+    const beforeResult = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: PKG_ROOT, timeout: 10000 });
     if (beforeResult.code !== 0) {
       await client?.sendMessage(chatId, `❌ 无法获取当前 HEAD: ${beforeResult.stderr}`, msgId);
       return false;
@@ -851,7 +966,7 @@ export default function (pi: ExtensionAPI) {
     const BEFORE_SHA = beforeResult.stdout.trim();
 
     // Step 3: git pull --ff-only
-    const pullResult = await pi.exec("git", ["pull", "--ff-only"], { cwd: FORK_DIR, timeout: 60000 });
+    const pullResult = await pi.exec("git", ["pull", "--ff-only"], { cwd: PKG_ROOT, timeout: 60000 });
     if (pullResult.code !== 0) {
       await client?.sendMessage(
         chatId,
@@ -862,7 +977,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Step 4: 检查是否有更新
-    const afterResult = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: FORK_DIR, timeout: 10000 });
+    const afterResult = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: PKG_ROOT, timeout: 10000 });
     const AFTER_SHA = afterResult.stdout.trim();
     if (AFTER_SHA === BEFORE_SHA) {
       const short = BEFORE_SHA.substring(0, 7);
@@ -871,9 +986,9 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Step 5: npm ci
-    const ciResult = await pi.exec("npm", ["ci", "--silent"], { cwd: FORK_DIR, timeout: 120000 });
+    const ciResult = await pi.exec("npm", ["ci", "--silent"], { cwd: PKG_ROOT, timeout: 120000 });
     if (ciResult.code !== 0) {
-      const rolledBack = await rollbackToBefore(BEFORE_SHA);
+      const rolledBack = await rollbackToBefore(BEFORE_SHA, PKG_ROOT);
       await client?.sendMessage(
         chatId,
         `❌ npm ci 失败，${rolledBack ? "已回滚到更新前" : "回滚失败，请人工检查"}。`,
@@ -883,7 +998,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Step 6: 强制验证代码：有 build 跑 build，否则跑 typecheck
-    const pkgJson = JSON.parse(readFileSync(join(FORK_DIR, "package.json"), "utf-8"));
+    const pkgJson = JSON.parse(readFileSync(join(PKG_ROOT, "package.json"), "utf-8"));
     const validation = pkgJson.scripts?.build
       ? { label: "build", args: ["run", "build"] }
       : pkgJson.scripts?.typecheck
@@ -891,7 +1006,7 @@ export default function (pi: ExtensionAPI) {
         : null;
 
     if (!validation) {
-      const rolledBack = await rollbackToBefore(BEFORE_SHA);
+      const rolledBack = await rollbackToBefore(BEFORE_SHA, PKG_ROOT);
       await client?.sendMessage(
         chatId,
         `❌ package.json 缺少 build/typecheck 脚本，${rolledBack ? "已回滚" : "回滚失败，请人工检查"}。`,
@@ -900,9 +1015,9 @@ export default function (pi: ExtensionAPI) {
       return false;
     }
 
-    const validationResult = await pi.exec("npm", validation.args, { cwd: FORK_DIR, timeout: 120000 });
+    const validationResult = await pi.exec("npm", validation.args, { cwd: PKG_ROOT, timeout: 120000 });
     if (validationResult.code !== 0) {
-      const rolledBack = await rollbackToBefore(BEFORE_SHA);
+      const rolledBack = await rollbackToBefore(BEFORE_SHA, PKG_ROOT);
       await client?.sendMessage(
         chatId,
         `❌ ${validation.label} 失败:\n\`\`\`\n${validationResult.stderr.substring(0, 500)}\n\`\`\`\n${rolledBack ? "已回滚到更新前。" : "回滚失败，请人工检查。"}`,
@@ -924,22 +1039,147 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** 回滚到 BEFORE_SHA：git reset + best-effort npm ci && build/typecheck */
-  async function rollbackToBefore(beforeSha: string): Promise<boolean> {
-    const FORK_DIR = join(homedir(), ".pi", "agent", "git", "github.com", "feir", "pi-feishu");
-    const resetResult = await pi.exec("git", ["reset", "--hard", beforeSha], { cwd: FORK_DIR, timeout: 30000 });
+  async function rollbackToBefore(beforeSha: string, pkgRoot: string): Promise<boolean> {
+    const resetResult = await pi.exec("git", ["reset", "--hard", beforeSha], { cwd: pkgRoot, timeout: 30000 });
     const resetOk = resetResult.code === 0;
     try {
-      await pi.exec("npm", ["ci", "--silent"], { cwd: FORK_DIR, timeout: 120000 });
+      await pi.exec("npm", ["ci", "--silent"], { cwd: pkgRoot, timeout: 120000 });
     } catch { /* best-effort */ }
     try {
-      const pkgJson = JSON.parse(readFileSync(join(FORK_DIR, "package.json"), "utf-8"));
+      const pkgJson = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf-8"));
       if (pkgJson.scripts?.build) {
-        await pi.exec("npm", ["run", "build"], { cwd: FORK_DIR, timeout: 120000 });
+        await pi.exec("npm", ["run", "build"], { cwd: pkgRoot, timeout: 120000 });
       } else if (pkgJson.scripts?.typecheck) {
-        await pi.exec("npm", ["run", "typecheck"], { cwd: FORK_DIR, timeout: 120000 });
+        await pi.exec("npm", ["run", "typecheck"], { cwd: pkgRoot, timeout: 120000 });
       }
     } catch { /* best-effort */ }
     return resetOk;
+  }
+
+  // ─── /quota 命令处理 ─────────────────────────────────
+
+  async function handleQuotaCommand(chatId: string, msgId: string): Promise<void> {
+    const healthPath = join(STATE_DIR, "health-cache.json");
+    let healthData: Record<string, unknown> | null = null;
+
+    // Try reading health cache file
+    if (existsSync(healthPath)) {
+      try {
+        healthData = JSON.parse(readFileSync(healthPath, "utf-8"));
+      } catch {
+        // stale/corrupt, ignore
+      }
+    }
+
+    if (!healthData || !healthData.models) {
+      await client?.sendMessage(chatId, "暂无配额数据。pi-main-fallback 扩展可能未加载，或尚未完成首次健康检查。", msgId);
+      return;
+    }
+
+    const models = healthData.models as Record<string, Record<string, unknown>>;
+    const ts = healthData.ts as number;
+    const age = ts ? Math.floor((Date.now() - ts) / 1000) : -1;
+
+    const statusEmoji: Record<string, string> = {
+      healthy: "🟢",
+      unavailable: "🔴",
+      exhausted: "⛔",
+      unknown: "❓",
+    };
+
+    const providerNames: Record<string, string> = {
+      "anthropic/claude-opus-4-7": "Anthropic (Claude Opus 4)",
+      "openai-codex/gpt-5.5": "Codex (GPT-5.5)",
+      "deepseek/deepseek-v4-pro": "DeepSeek (V4 Pro)",
+    };
+
+    const lines: string[] = ["📊 **模型配额**"];
+
+    for (const [key, info] of Object.entries(models)) {
+      const name = providerNames[key] ?? key;
+      const status = (info.status as string) ?? "unknown";
+      const emoji = statusEmoji[status] ?? "❓";
+
+      lines.push("");
+      lines.push(`${emoji} **${name}**: ${status}`);
+
+      if (info.error) {
+        lines.push(`   ↳ 错误: ${info.error}`);
+      }
+
+      const util = info.utilization as Record<string, number> | undefined;
+      if (util) {
+        const utilParts: string[] = [];
+        for (const [w, v] of Object.entries(util)) {
+          utilParts.push(`${w}: ${v.toFixed(1)}%`);
+        }
+        if (utilParts.length > 0) {
+          lines.push(`   ↳ 使用率: ${utilParts.join(", ")}`);
+        }
+      }
+
+      if (info.balance) {
+        lines.push(`   ↳ 余额: ${info.balance} ${info.currency ?? "CNY"}`);
+      }
+
+      if (info.resetAt && typeof info.resetAt === "number" && info.resetAt > Date.now()) {
+        const resetDate = new Date(info.resetAt);
+        const remaining = Math.floor((info.resetAt - Date.now()) / 1000);
+        const hr = Math.floor(remaining / 3600);
+        const min = Math.floor((remaining % 3600) / 60);
+        lines.push(`   ↳ 重置: ${resetDate.toLocaleString("zh-CN")} (${hr}h${min}m 后)`);
+      }
+    }
+
+    // ─── Cooldowns (round 2 fix: HIGH-5) ──────────────
+    const cooldowns = healthData.cooldowns as Array<{ model: string; until: number; reason: string }> | undefined;
+    if (cooldowns && cooldowns.length > 0) {
+      lines.push("");
+      lines.push("⏳ **冷却中**");
+      for (const cd of cooldowns) {
+        if (cd.until <= Date.now()) continue;
+        const remaining = Math.floor((cd.until - Date.now()) / 1000);
+        const min = Math.floor(remaining / 60);
+        const sec = remaining % 60;
+        lines.push(`   ${providerNames[cd.model] ?? cd.model}: ${min}m${sec}s (${cd.reason})`);
+      }
+    }
+
+    // ─── Exhaustion (round 2 fix: HIGH-5) ─────────────
+    const exhaustion = healthData.exhaustion as { suspended: boolean; suspendUntil: number; consecutive: number } | undefined;
+    if (exhaustion?.suspended && exhaustion.suspendUntil > Date.now()) {
+      const wait = Math.floor((exhaustion.suspendUntil - Date.now()) / 1000);
+      const min = Math.floor(wait / 60);
+      const sec = wait % 60;
+      lines.push("");
+      lines.push(`⛔ **链尾退避** (第 ${exhaustion.consecutive} 次): ${min}m${sec}s 后重试`);
+    }
+
+    // ─── Recent fallback events + counters (round 2 fix: HIGH-5) ──
+    const counters = healthData.counters as Record<string, number> | undefined;
+    if (counters && Object.keys(counters).length > 0) {
+      lines.push("");
+      lines.push("📈 **累计 fallback (按原因)**");
+      for (const [reason, count] of Object.entries(counters).sort((a, b) => b[1] - a[1])) {
+        lines.push(`   ${reason}: ${count}`);
+      }
+    }
+    const recentEvents = healthData.recentEvents as Array<{ ts: number; reason: string; from: string; to: string }> | undefined;
+    if (recentEvents && recentEvents.length > 0) {
+      lines.push("");
+      lines.push(`🕒 **最近 ${Math.min(recentEvents.length, 5)} 次切换**`);
+      for (const ev of recentEvents.slice(-5).reverse()) {
+        const evAge = Math.floor((Date.now() - ev.ts) / 1000);
+        lines.push(`   ${evAge}s 前: ${ev.from} → ${ev.to} (${ev.reason})`);
+      }
+    }
+
+    if (age >= 0) {
+      lines.push("");
+      lines.push(`_数据 ${age}s 前更新_`);
+    }
+
+    await client?.sendMessage(chatId, lines.join("\n"), msgId);
   }
 
   // ═══════════════════════════════════════════════════════
@@ -1022,7 +1262,7 @@ export default function (pi: ExtensionAPI) {
       // 中间轮：assistant 有文本 + 工具调用 → 发送中间文本（回复到用户消息）
       const chunks = chunkText(processed, MAX_TEXT_CHUNK);
       for (const chunk of chunks) {
-        client.sendMessage(state.chatId, chunk, state.userMsgId);
+        client.sendMessage(state.chatId, chunk, state.userMsgId).catch(() => {});
       }
     } else {
       // 最终轮（或无工具调用的单轮）
@@ -1032,11 +1272,8 @@ export default function (pi: ExtensionAPI) {
         const card = FeishuClient.buildCompletedCard(panels, processed, "完成");
         client.updateCard(state.progressMsgId, card).catch(() => {});
       } else {
-        // 无进度卡 → 发送文本（新消息）
-        const chunks = chunkText(processed, MAX_TEXT_CHUNK);
-        for (const chunk of chunks) {
-          client.sendMessage(state.chatId, chunk);
-        }
+        // 无进度卡 → 发送文本（单卡片，safeText 处理超长截断）
+        client.sendMessage(state.chatId, processed).catch(() => {});
       }
     }
 
@@ -1046,17 +1283,16 @@ export default function (pi: ExtensionAPI) {
   // ─── agent_end → 清理 + 处理下一条排队消息 ──────────
 
   pi.on("agent_end", (_event: AgentEndEvent) => {
-    if (!client || client.getStatus() !== "connected") return;
+    // 本地状态清理不依赖 Feishu 连接状态
     const state = findActiveState();
     if (!state) return;
 
     const chatId = state.chatId;
 
-    // 移除 Typing Reaction
-    client.stopTyping(chatId, true).catch(() => {});
-
-    // 清理当前状态
     chatStates.delete(chatId);
+
+    // 网络操作 best-effort
+    client?.stopTyping(chatId, true).catch(() => {});
 
     // 刷新所有队列（包括当前聊天）
     const queue = chatQueues.get(chatId);
